@@ -1,5 +1,7 @@
 # opendoc-core
-
+<p>
+  <img src="./logo-op3-black.svg" alt="opendoc-icon" width="200"/>
+</p>
 Lógica pura de [OpenDoc](https://github.com/daidarzzz/opendoc), sin Tauri y
 sin red:
 
