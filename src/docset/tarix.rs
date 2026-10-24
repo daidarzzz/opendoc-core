@@ -131,6 +131,16 @@ pub fn cache_is_ready(cache_base: &Path, id: &str, tgz_path: &Path) -> bool {
     cache_is_valid(&cache_dir_for(cache_base, id), &stamp)
 }
 
+/// `true` si la caché de `id` tiene `Contents/Resources/Documents/`
+/// extraída. La extracción real solo renombra a la carpeta final cuando ha
+/// terminado, así que la presencia de `Documents/` basta para reutilizarla
+/// (las entradas se leen siempre del `.dsidx` original).
+pub fn cache_has_documents(cache_base: &Path, id: &str) -> bool {
+    cache_dir_for(cache_base, id)
+        .join("Contents/Resources/Documents")
+        .is_dir()
+}
+
 /// Asegura la caché: la reutiliza si es válida o extrae de cero.
 pub fn ensure_extracted(
     cache_base: &Path,

@@ -14,9 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::docset::tarix::{
-    cache_dir_for, cache_is_ready, ensure_extracted, sweep_unreferenced_caches,
-};
+use crate::docset::tarix::{cache_dir_for, ensure_extracted, sweep_unreferenced_caches};
 use crate::docset::{
     apply_to_docset, read_index, read_info_plist, scan_dir, Docset, Entry, IssueKind, PendingTarix,
     ScanError, ScanIssue, TarixError, TarixLimits,
@@ -199,8 +197,7 @@ pub fn installed_from_cache(
     pending: &PendingTarix,
 ) -> Result<InstalledTarix, TarixError> {
     let resources = pending.root_path.join("Contents/Resources");
-    let tgz = resources.join("tarix.tgz");
-    if !cache_is_ready(tarix_cache, &pending.id, &tgz) {
+    if !crate::docset::tarix::cache_has_documents(tarix_cache, &pending.id) {
         return Err(TarixError::Corrupt(format!(
             "cache not ready for {}",
             pending.id
