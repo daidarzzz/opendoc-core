@@ -11,6 +11,12 @@
 //!   es el peor de ellas y el score la suma.
 //! - `Pattern::new` (no `parse`) + partición manual: caracteres de API
 //!   (`C++`, `!important`) nunca se leen como sintaxis de patrón.
+//! - Incremental: si la consulta amplía la anterior con el mismo filtro,
+//!   solo se revisan las entradas que ya coincidieron (más letras o más
+//!   palabras nunca añaden coincidencias). Con muchos candidatos se
+//!   reparte entre hilos; la clave de orden incluye el índice, así que el
+//!   resultado es idéntico al recorrido completo en serie (ver tests
+//!   `*_match_full_scan`).
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
@@ -19,9 +25,18 @@ use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Matcher, Utf32Str};
 use serde::{Deserialize, Serialize};
 
-use super::index::{IndexedEntry, SearchIndex};
+use super::index::{new_scratch, IndexedEntry, LastQuery, SearchIndex};
 
+/// Clave de orden de un hit: (tier, tipo, score↓, nombre, docset, índice).
+/// El índice la hace total: el resultado no depende de cuántos hilos
+/// busquen ni en qué orden terminen.
 type RankedHit<'a> = (u8, u8, Reverse<u32>, &'a str, &'a str, usize);
+
+/// A partir de cuántos candidatos se reparte la búsqueda entre hilos
+/// (por debajo, crear hilos cuesta más de lo que ahorra).
+const PARALLEL_MIN: usize = 40_000;
+/// Tope de hilos de búsqueda.
+const MAX_THREADS: usize = 8;
 
 /// Un resultado listo para la UI (serializable para T6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,8 +53,63 @@ pub struct SearchResult {
     pub score: u32,
 }
 
+/// Qué entradas hay que mirar.
+#[derive(Clone, Copy)]
+enum Candidates<'a> {
+    /// Todas, en `[inicio, fin)` (con el filtro de docsets aplicado).
+    Range(usize, usize),
+    /// Solo estas (las que coincidieron con la consulta anterior).
+    List(&'a [u32]),
+}
+
+impl Candidates<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Range(start, end) => end - start,
+            Self::List(list) => list.len(),
+        }
+    }
+
+    /// Parte en `n` trozos contiguos (el orden se conserva).
+    fn split(self, n: usize) -> Vec<Self> {
+        let len = self.len();
+        let chunk = len.div_ceil(n.max(1)).max(1);
+        (0..len)
+            .step_by(chunk)
+            .map(|from| {
+                let to = (from + chunk).min(len);
+                match self {
+                    Self::Range(start, _) => Self::Range(start + from, start + to),
+                    Self::List(list) => Self::List(&list[from..to]),
+                }
+            })
+            .collect()
+    }
+}
+
+/// Consulta ya preparada (compartida entre hilos).
+struct Prepared<'q> {
+    words: &'q [String],
+    patterns: &'q [Pattern],
+    allowed: Option<&'q HashSet<&'q str>>,
+    limit: usize,
+}
+
+/// Resultado de recorrer un trozo: mejores `limit` + todos los que
+/// coincidieron (para la siguiente tecla).
+struct Scan<'a> {
+    top: BinaryHeap<RankedHit<'a>>,
+    hits: Vec<u32>,
+}
+
 /// Busca en el índice. `docset_ids` filtra por docset; `limit` trunca.
 /// Nunca falla: sin coincidencias devuelve vacío.
+///
+/// Rápida al escribir: si la consulta amplía la anterior (`bo` → `bor`,
+/// `str` → `str format`) con el mismo filtro, solo se miran las entradas
+/// que ya coincidieron (una coincidencia difusa con más letras implica la
+/// de menos). Con muchos candidatos, el recorrido se reparte entre hilos.
+/// El resultado es idéntico al de recorrer todo el índice.
 pub fn search(
     index: &mut SearchIndex,
     query: &str,
@@ -64,45 +134,77 @@ pub fn search(
         .collect();
     let allowed: Option<HashSet<&str>> =
         docset_ids.map(|ids| ids.iter().map(String::as_str).collect());
+    let prepared = Prepared {
+        words: &words,
+        patterns: &patterns,
+        allowed: allowed.as_ref(),
+        limit,
+    };
 
     let SearchIndex {
         entries,
-        matcher,
-        utf32_buf,
+        matchers,
+        last,
         ..
     } = &mut *index;
-    // La paleta solo enseña 20 filas: conserva el mejor top-K durante el
-    // recorrido y evita ordenar/guardar todos los hits de docsets grandes.
-    let mut hits: BinaryHeap<RankedHit<'_>> = BinaryHeap::with_capacity(limit);
-    for (idx, entry) in entries.iter().enumerate() {
-        if let Some(allowed) = &allowed {
-            if !allowed.contains(entry.docset_id.as_ref()) {
-                continue;
-            }
-        }
-        if words.iter().any(|word| !could_match_literals(entry, word)) {
-            continue;
-        }
-        if let Some((tier, score)) = match_entry(matcher, utf32_buf, entry, &words, &patterns) {
-            let candidate = (
-                tier,
-                kind_rank(&entry.kind),
-                Reverse(score),
-                entry.name.as_str(),
-                entry.docset_id.as_ref(),
-                idx,
-            );
-            if hits.len() < limit {
-                hits.push(candidate);
-            } else if hits.peek().is_some_and(|worst| candidate < *worst) {
-                hits.pop();
-                hits.push(candidate);
-            }
-        }
+    // La consulta anterior sirve si esta la amplía con el mismo filtro.
+    let previous = last.take().filter(|prev| {
+        query.starts_with(prev.query.as_str()) && prev.docset_ids.as_deref() == docset_ids
+    });
+    let candidates = match &previous {
+        Some(prev) => Candidates::List(&prev.hits),
+        None => Candidates::Range(0, entries.len()),
+    };
+
+    let threads = if candidates.len() >= PARALLEL_MIN {
+        std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .clamp(1, MAX_THREADS)
+    } else {
+        1
+    };
+    if matchers.len() < threads {
+        matchers.resize_with(threads, new_scratch);
     }
-    let mut hits = hits.into_vec();
-    hits.sort_unstable();
-    hits.into_iter()
+
+    let entries: &[IndexedEntry] = entries;
+    let scans: Vec<Scan<'_>> = if threads == 1 {
+        let (matcher, buf) = &mut matchers[0];
+        vec![scan(entries, candidates, &prepared, matcher, buf)]
+    } else {
+        let chunks = candidates.split(threads);
+        let prepared = &prepared;
+        std::thread::scope(|s| {
+            let handles: Vec<_> = chunks
+                .into_iter()
+                .zip(matchers.iter_mut())
+                .map(|(chunk, (matcher, buf))| {
+                    s.spawn(move || scan(entries, chunk, prepared, matcher, buf))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| match h.join() {
+                    Ok(scan) => scan,
+                    // Un pánico en un hilo se propaga igual que en serie.
+                    Err(panic) => std::panic::resume_unwind(panic),
+                })
+                .collect()
+        })
+    };
+
+    // Une los trozos: los hits quedan en orden de índice (trozos contiguos
+    // y en orden) y el top se recalcula sobre la unión de los tops.
+    let mut hits = Vec::with_capacity(scans.iter().map(|s| s.hits.len()).sum());
+    let mut top: Vec<RankedHit<'_>> = Vec::with_capacity(limit * scans.len());
+    for scan in scans {
+        hits.extend(scan.hits);
+        top.extend(scan.top.into_vec());
+    }
+    top.sort_unstable();
+    top.truncate(limit);
+    let results = top
+        .into_iter()
         .map(|(_, _, Reverse(score), _, _, idx)| {
             let entry = &entries[idx];
             SearchResult {
@@ -113,7 +215,74 @@ pub fn search(
                 score,
             }
         })
-        .collect()
+        .collect();
+    *last = Some(LastQuery {
+        query: query.to_string(),
+        docset_ids: docset_ids.map(<[String]>::to_vec),
+        hits,
+    });
+    results
+}
+
+/// Recorre un trozo de candidatos con su propio scratch de nucleo.
+fn scan<'a>(
+    entries: &'a [IndexedEntry],
+    candidates: Candidates<'_>,
+    q: &Prepared<'_>,
+    matcher: &mut Matcher,
+    buf: &mut Vec<char>,
+) -> Scan<'a> {
+    // La paleta solo enseña 20 filas: conserva el mejor top-K durante el
+    // recorrido y evita ordenar/guardar todos los hits de docsets grandes.
+    let mut top: BinaryHeap<RankedHit<'a>> = BinaryHeap::with_capacity(q.limit + 1);
+    let mut hits = Vec::new();
+    let mut visit = |idx: usize, entry: &'a IndexedEntry| {
+        if q.words
+            .iter()
+            .any(|word| !could_match_literals(entry, word))
+        {
+            return;
+        }
+        let Some((tier, score)) = match_entry(matcher, buf, entry, q.words, q.patterns) else {
+            return;
+        };
+        // Los índices caben en u32 (un índice con más de 4.000 millones de
+        // entradas no cabría en memoria de todas formas).
+        hits.push(idx as u32);
+        let candidate = (
+            tier,
+            entry.kind_rank,
+            Reverse(score),
+            entry.name.as_str(),
+            entry.docset_id.as_ref(),
+            idx,
+        );
+        if top.len() < q.limit {
+            top.push(candidate);
+        } else if top.peek().is_some_and(|worst| candidate < *worst) {
+            top.pop();
+            top.push(candidate);
+        }
+    };
+    match candidates {
+        Candidates::Range(start, end) => {
+            for (idx, entry) in entries.iter().enumerate().take(end).skip(start) {
+                if let Some(allowed) = q.allowed {
+                    if !allowed.contains(entry.docset_id.as_ref()) {
+                        continue;
+                    }
+                }
+                visit(idx, entry);
+            }
+        }
+        // Ya filtrados por docset en la consulta anterior (mismo filtro).
+        Candidates::List(list) => {
+            for &idx in list {
+                visit(idx as usize, &entries[idx as usize]);
+            }
+        }
+    }
+    Scan { top, hits }
 }
 
 /// Descarta candidatos que carecen de dígitos/signos ASCII obligatorios.
@@ -239,15 +408,34 @@ pub(crate) fn last_segment(name: &str) -> Option<&str> {
 }
 
 /// Prioridad por tipo: API (0-2) por encima de guías y resto (3).
-fn kind_rank(kind: &str) -> u8 {
-    match kind.to_lowercase().as_str() {
-        "class" | "struct" | "union" | "enum" | "protocol" | "interface" | "trait" | "category" => {
-            0
-        }
-        "function" | "method" | "constructor" | "destructor" | "operator" | "macro" => 1,
-        "property" | "constant" | "variable" => 2,
-        _ => 3,
-    }
+/// Sin asignar memoria (se calcula para cada entrada al indexar): la
+/// comparación ASCII sin mayúsculas equivale aquí a `to_lowercase()`,
+/// porque ninguna de estas palabras tiene letras cuyo plegado Unicode
+/// salga de un carácter no ASCII.
+pub(crate) fn kind_rank(kind: &str) -> u8 {
+    const RANKS: &[(&str, u8)] = &[
+        ("class", 0),
+        ("struct", 0),
+        ("union", 0),
+        ("enum", 0),
+        ("protocol", 0),
+        ("interface", 0),
+        ("trait", 0),
+        ("category", 0),
+        ("function", 1),
+        ("method", 1),
+        ("constructor", 1),
+        ("destructor", 1),
+        ("operator", 1),
+        ("macro", 1),
+        ("property", 2),
+        ("constant", 2),
+        ("variable", 2),
+    ];
+    RANKS
+        .iter()
+        .find(|(word, _)| kind.eq_ignore_ascii_case(word))
+        .map_or(3, |&(_, rank)| rank)
 }
 
 #[cfg(test)]
@@ -409,9 +597,9 @@ mod tests {
         assert!(worst.as_secs() < 1, "búsqueda lenta: {worst:?}");
     }
 
-    /// Escala: medido en release build=17.9ms búsqueda=37.4ms (< 50ms).
-    /// En debug con [profile.dev.package."*"] opt-level=3: build~130ms,
-    /// búsqueda~340ms a 300k (los asserts son cotas debug amplias).
+    /// Escala: 300k entradas sintéticas. Los asserts son cotas amplias
+    /// (también valen en debug); las cifras reales en release están en el
+    /// README (sección Rendimiento) y salen del benchmark externo.
     #[test]
     fn large_synthetic_index_scales() {
         let kinds = ["Class", "Function", "Method", "Property", "Guide"];
@@ -455,5 +643,272 @@ mod tests {
             .collect();
         // Normalization::Smart pliega diacríticos (naive → naïve-case).
         assert_eq!(naive[0], "naïve-case");
+    }
+
+    // ── Equivalencia con el algoritmo anterior ──────────────────────────
+    //
+    // La búsqueda incremental y en paralelo debe devolver EXACTAMENTE lo
+    // mismo (orden y scores) que recorrer todo el índice en serie, como
+    // hacía la versión 0.1.1. `reference` es ese algoritmo, sin caché ni
+    // hilos ni tipo precalculado.
+
+    fn reference(
+        index: &SearchIndex,
+        query: &str,
+        docset_ids: Option<&[String]>,
+        limit: usize,
+    ) -> Vec<SearchResult> {
+        let query = query.trim();
+        if query.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        let patterns: Vec<Pattern> = query
+            .split_whitespace()
+            .map(|w| {
+                Pattern::new(
+                    w,
+                    CaseMatching::Ignore,
+                    Normalization::Smart,
+                    AtomKind::Fuzzy,
+                )
+            })
+            .collect();
+        let mut matcher = Matcher::new(nucleo_matcher::Config::DEFAULT);
+        let mut buf = Vec::new();
+        let mut hits = Vec::new();
+        for (idx, entry) in index.entries.iter().enumerate() {
+            if let Some(ids) = docset_ids {
+                if !ids.iter().any(|id| id.as_str() == entry.docset_id.as_ref()) {
+                    continue;
+                }
+            }
+            if words.iter().any(|w| !could_match_literals(entry, w)) {
+                continue;
+            }
+            if let Some((tier, score)) =
+                match_entry(&mut matcher, &mut buf, entry, &words, &patterns)
+            {
+                hits.push((
+                    tier,
+                    kind_rank(&entry.kind),
+                    Reverse(score),
+                    entry.name.clone(),
+                    entry.docset_id.to_string(),
+                    idx,
+                ));
+            }
+        }
+        hits.sort();
+        hits.truncate(limit);
+        hits.into_iter()
+            .map(|(_, _, Reverse(score), _, _, idx)| {
+                let e = &index.entries[idx];
+                SearchResult {
+                    docset_id: e.docset_id.to_string(),
+                    name: e.name.clone(),
+                    kind: e.kind.to_string(),
+                    path: e.path.clone(),
+                    score,
+                }
+            })
+            .collect()
+    }
+
+    /// Escribe `text` letra a letra (y luego lo borra) comparando cada paso.
+    fn type_and_compare(
+        index: &mut SearchIndex,
+        text: &str,
+        filter: Option<&[String]>,
+        limit: usize,
+    ) {
+        let steps: Vec<&str> = text
+            .char_indices()
+            .map(|(i, c)| &text[..i + c.len_utf8()])
+            .collect();
+        for q in steps.iter().chain(steps.iter().rev()) {
+            let got = search(index, q, filter, limit);
+            let want = reference(index, q, filter, limit);
+            assert_eq!(got, want, "consulta {q:?} filtro {filter:?}");
+        }
+    }
+
+    /// Índice sintético grande y variado: separadores de API, mayúsculas,
+    /// dígitos, signos y Unicode; por encima de `PARALLEL_MIN` para que la
+    /// búsqueda vaya en paralelo.
+    fn varied_index(n: usize) -> SearchIndex {
+        let stems = [
+            "border-radius",
+            "std::vector",
+            "str.format",
+            "Array#map",
+            "grid",
+            "naïve",
+            "Café",
+            "operator<<",
+            "!important",
+            "C++",
+            "push_back",
+            "HashMap",
+            "border",
+            "vectorize",
+            "format_args",
+            "Grid-Template",
+            "radius",
+            "i18n",
+            "utf8",
+            "x264",
+        ];
+        let kinds = [
+            "Class", "Function", "Method", "Property", "Guide", "clm", "Unknown",
+        ];
+        let mut raw = Vec::with_capacity(n);
+        for i in 0..n {
+            let stem = stems[i % stems.len()];
+            let name = match i % 4 {
+                0 => stem.to_string(),
+                1 => format!("mod{}.{stem}", i % 97),
+                2 => format!("{stem}_{i}"),
+                _ => format!("ns{}::{stem}::item{}", i % 13, i % 31),
+            };
+            raw.push(entry(
+                &format!("ds{}", i % 9),
+                &name,
+                kinds[i % kinds.len()],
+            ));
+        }
+        SearchIndex::build(raw)
+    }
+
+    #[test]
+    fn incremental_and_parallel_match_full_scan() {
+        let mut index = varied_index(PARALLEL_MIN + 5_000);
+        let filter = ["ds1".to_string(), "ds4".to_string()];
+        for text in [
+            "border radius",
+            "std::vec",
+            "str.format",
+            "Array#map",
+            "operator<<",
+            "!imp",
+            "C++",
+            "naive",
+            "CAFÉ",
+            "x264",
+            "item1 vec",
+            "zzz",
+            "b",
+            "i18n",
+        ] {
+            type_and_compare(&mut index, text, None, 20);
+            type_and_compare(&mut index, text, Some(&filter), 20);
+        }
+        // Cambiar el filtro o el límite a mitad no reutiliza mal la caché.
+        let a = search(&mut index, "bor", None, 20);
+        assert_eq!(a, reference(&index, "bor", None, 20));
+        let b = search(&mut index, "bord", Some(&filter), 5);
+        assert_eq!(b, reference(&index, "bord", Some(&filter), 5));
+        let c = search(&mut index, "borde", None, 50);
+        assert_eq!(c, reference(&index, "borde", None, 50));
+    }
+
+    #[test]
+    fn kind_rank_matches_lowercase_version() {
+        let old = |kind: &str| match kind.to_lowercase().as_str() {
+            "class" | "struct" | "union" | "enum" | "protocol" | "interface" | "trait"
+            | "category" => 0,
+            "function" | "method" | "constructor" | "destructor" | "operator" | "macro" => 1,
+            "property" | "constant" | "variable" => 2,
+            _ => 3,
+        };
+        for kind in [
+            "Class",
+            "CLASS",
+            "class",
+            "Struct",
+            "Function",
+            "METHOD",
+            "Macro",
+            "Property",
+            "Constant",
+            "Variable",
+            "Guide",
+            "clm",
+            "Unknown",
+            "",
+            "İnterface",
+            "Clase",
+            "Ünion",
+        ] {
+            assert_eq!(kind_rank(kind), old(kind), "{kind}");
+        }
+    }
+
+    #[test]
+    fn changing_entries_forgets_the_previous_query() {
+        let mut index = varied_index(2_000);
+        assert_eq!(
+            search(&mut index, "gr", None, 20),
+            reference(&index, "gr", None, 20)
+        );
+        // Llegan entradas nuevas que coinciden con "gri" pero no estaban
+        // entre los candidatos de "gr" (no existían).
+        index.extend(vec![entry("nuevo", "grilla", "Class")]);
+        let hits = search(&mut index, "gri", None, 20);
+        assert_eq!(hits, reference(&index, "gri", None, 20));
+        assert!(hits.iter().any(|h| h.name == "grilla"));
+        // Y al quitar/sustituir docsets también se olvida.
+        assert!(!search(&mut index, "gril", None, 20).is_empty());
+        index.remove_docset("nuevo");
+        assert!(search(&mut index, "grill", None, 20).is_empty());
+        index.replace_docset(&[], vec![entry("otro", "grillo", "Guide")]);
+        assert_eq!(search(&mut index, "grill", None, 20)[0].name, "grillo");
+    }
+
+    #[test]
+    fn real_indexes_match_full_scan() {
+        let mut all = Vec::new();
+        for (path, id) in [
+            ("CSS.docset/Contents/Resources/docSet.dsidx", "css"),
+            ("C++.docset/Contents/Resources/docSet.dsidx", "cpp"),
+            ("Python_3.docset/Contents/Resources/docSet.dsidx", "py"),
+            ("Swift.docset/Contents/Resources/docSet.dsidx", "swift"),
+        ] {
+            if let Some(dsidx) = crate::docset::fixture_or_skip(path) {
+                all.extend(
+                    crate::docset::read_index(&dsidx, id)
+                        .expect("leer índice")
+                        .entries,
+                );
+            }
+        }
+        if all.is_empty() {
+            return;
+        }
+        // Repetido hasta superar el umbral de paralelo, con ids distintos.
+        let mut big = Vec::new();
+        let mut copy = 0;
+        while big.len() < PARALLEL_MIN * 2 {
+            for e in &all {
+                let mut e = e.clone();
+                e.docset_id = format!("{}{copy}", e.docset_id);
+                big.push(e);
+            }
+            copy += 1;
+        }
+        let mut index = SearchIndex::build(big);
+        let filter = ["css0".to_string(), "cpp1".to_string()];
+        for text in [
+            "grid",
+            "border-radius",
+            "vector",
+            "push back",
+            "str.format",
+            "std::map",
+            "color",
+        ] {
+            type_and_compare(&mut index, text, None, 20);
+            type_and_compare(&mut index, text, Some(&filter), 20);
+        }
     }
 }

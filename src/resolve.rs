@@ -128,6 +128,30 @@ fn has_drive_letter(s: &str) -> bool {
     bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
+thread_local! {
+    /// Última raíz `Documents/` canonicalizada en este hilo. Una página
+    /// pide decenas de recursos del mismo docset y en Windows
+    /// `canonicalize` abre un handle cada vez. Fail-closed: si la carpeta
+    /// cambia después (otro destino, symlink), los ficheros nuevos ya no
+    /// empiezan por la raíz guardada y se rechazan.
+    static DOCS_CANON: std::cell::RefCell<Option<(PathBuf, PathBuf)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `documents.canonicalize()` recordando la última raíz del hilo.
+fn canonical_documents(documents: &Path) -> std::io::Result<PathBuf> {
+    DOCS_CANON.with(|cell| {
+        if let Some((raw, canon)) = cell.borrow().as_ref() {
+            if raw == documents {
+                return Ok(canon.clone());
+            }
+        }
+        let canon = documents.canonicalize()?;
+        *cell.borrow_mut() = Some((documents.to_path_buf(), canon.clone()));
+        Ok(canon)
+    })
+}
+
 /// Verifica canonicalización + prefijo (symlinks intermedios, `..`
 /// residuales) y calcula el MIME.
 fn checked_canonical(
@@ -135,9 +159,8 @@ fn checked_canonical(
     candidate: &Path,
     raw_path: &str,
 ) -> Result<ResolvedFile, ResolveError> {
-    let docs_canon = documents
-        .canonicalize()
-        .map_err(|_| ResolveError::NotFound(raw_path.to_string()))?;
+    let docs_canon =
+        canonical_documents(documents).map_err(|_| ResolveError::NotFound(raw_path.to_string()))?;
     let file_canon = candidate
         .canonicalize()
         .map_err(|_| ResolveError::NotFound(raw_path.to_string()))?;

@@ -6,9 +6,12 @@
 //! - `docset_id` y `kind` se repiten miles de veces: se internan en
 //!   `Arc<str>` vía pool para no duplicar `String` por entrada.
 //! - `Matcher` de nucleo (~135 KB de scratch) y el buffer UTF-32 se
-//!   reutilizan entre búsquedas; `search` (en `query.rs`) toma
-//!   `&mut SearchIndex` por eso, pero es determinista y no toca Tauri
-//!   (T6 lo llamará tras `Mutex`/`spawn_blocking`).
+//!   reutilizan entre búsquedas (uno por hilo de búsqueda); `search` (en
+//!   `query.rs`) toma `&mut SearchIndex` por eso, pero es determinista y
+//!   no toca Tauri (T6 lo llamará tras `Mutex`/`spawn_blocking`).
+//! - `search` recuerda los candidatos de la última consulta: al escribir
+//!   (`bo` → `bor`) solo vuelve a mirar esos. Cualquier cambio en las
+//!   entradas (`extend`, `remove_docset`, `replace_docset`) la olvida.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,13 +36,30 @@ pub struct IndexedEntry {
     pub kind: Arc<str>,
     /// Slug del docset. Internado: compartido entre entradas.
     pub docset_id: Arc<str>,
+    /// Prioridad del tipo en el ranking (precalculada: se consulta en
+    /// cada coincidencia de cada tecla).
+    pub(crate) kind_rank: u8,
+}
+
+/// Candidatos de la última búsqueda (ver `query.rs`).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LastQuery {
+    /// Consulta tal cual se buscó (con trim).
+    pub(crate) query: String,
+    /// Filtro de docsets con el que se buscó.
+    pub(crate) docset_ids: Option<Vec<String>>,
+    /// Índices (ascendentes) de TODAS las entradas que coincidieron.
+    pub(crate) hits: Vec<u32>,
 }
 
 /// Todas las entradas cargadas + scratch reutilizable de nucleo.
 pub struct SearchIndex {
     pub(crate) entries: Vec<IndexedEntry>,
-    pub(crate) matcher: Matcher,
-    pub(crate) utf32_buf: Vec<char>,
+    /// Scratch de nucleo por hilo de búsqueda (el 0 es el del hilo
+    /// llamador; los demás se crean al primer uso en paralelo).
+    pub(crate) matchers: Vec<(Matcher, Vec<char>)>,
+    /// Última búsqueda (búsqueda incremental al escribir).
+    pub(crate) last: Option<LastQuery>,
     pool: HashMap<String, Arc<str>>,
     /// Navegación por tipos: orden + conteos, reconstruida en cada
     /// `build`/`extend` (ver `browse`).
@@ -51,8 +71,8 @@ impl SearchIndex {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-            matcher: Matcher::new(Config::DEFAULT),
-            utf32_buf: Vec::with_capacity(256),
+            matchers: vec![new_scratch()],
+            last: None,
             pool: HashMap::new(),
             browse: BrowseCache::empty(),
         }
@@ -87,19 +107,45 @@ impl SearchIndex {
 
     /// Añade entradas al `Vec` interno (sin tocar la navegación).
     fn add_entries(&mut self, entries: Vec<Entry>) {
+        self.last = None;
         let Self {
             entries: mine,
             pool,
             ..
         } = self;
-        mine.extend(entries.into_iter().map(|e| IndexedEntry {
-            lower_name: e.name.to_lowercase(),
-            lower_segment: crate::search::query::last_segment(&e.name).map(str::to_lowercase),
-            name: e.name,
-            path: e.path,
-            kind: intern(pool, &e.kind),
-            docset_id: intern(pool, &e.docset_id),
-        }));
+        mine.reserve(entries.len());
+        // Las entradas llegan por docset y con tipos repetidos: se reutiliza
+        // el último valor internado antes de hashear la cadena en el pool.
+        let mut last_docset: Option<Arc<str>> = None;
+        let mut last_kind: Option<(Arc<str>, u8)> = None;
+        for e in entries {
+            let docset_id = match &last_docset {
+                Some(shared) if shared.as_ref() == e.docset_id => shared.clone(),
+                _ => {
+                    let shared = intern(pool, &e.docset_id);
+                    last_docset = Some(shared.clone());
+                    shared
+                }
+            };
+            let (kind, kind_rank) = match &last_kind {
+                Some((shared, rank)) if shared.as_ref() == e.kind => (shared.clone(), *rank),
+                _ => {
+                    let shared = intern(pool, &e.kind);
+                    let rank = crate::search::query::kind_rank(&e.kind);
+                    last_kind = Some((shared.clone(), rank));
+                    (shared, rank)
+                }
+            };
+            mine.push(IndexedEntry {
+                lower_name: e.name.to_lowercase(),
+                lower_segment: crate::search::query::last_segment(&e.name).map(str::to_lowercase),
+                kind_rank,
+                name: e.name,
+                path: e.path,
+                kind,
+                docset_id,
+            });
+        }
     }
 
     /// Añade entradas compartiendo el internado (p. ej. tarix instalados
@@ -126,6 +172,7 @@ impl SearchIndex {
     pub fn remove_docset(&mut self, docset_id: &str) {
         // FASE 0: solo medida.
         let t_rm = std::time::Instant::now();
+        self.last = None;
         self.entries.retain(|e| e.docset_id.as_ref() != docset_id);
         self.browse = BrowseCache::rebuild(&self.entries);
         crate::profile::mark(
@@ -146,6 +193,7 @@ impl SearchIndex {
         // FASE 0: solo medida.
         let t_replace = std::time::Instant::now();
         let added = entries.len();
+        self.last = None;
         self.entries
             .retain(|e| !old_ids.iter().any(|id| e.docset_id.as_ref() == id));
         self.add_entries(entries);
@@ -176,6 +224,11 @@ impl Default for SearchIndex {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Scratch de nucleo para un hilo: matcher + buffer UTF-32.
+pub(crate) fn new_scratch() -> (Matcher, Vec<char>) {
+    (Matcher::new(Config::DEFAULT), Vec::with_capacity(256))
 }
 
 /// Devuelve el `Arc<str>` canónico para `s`, creando una sola asignación

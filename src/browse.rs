@@ -166,50 +166,67 @@ impl BrowseCache {
         // FASE 0: solo medida.
         let t_rebuild = std::time::Instant::now();
         let n = entries.len();
-        let fold: Vec<String> = entries.iter().map(|e| e.name.to_lowercase()).collect();
-        let mut order: Vec<usize> = (0..entries.len()).collect();
-        order.sort_by(|&a, &b| {
-            (
-                &entries[a].docset_id,
-                &entries[a].kind,
-                &fold[a],
-                &entries[a].name,
-                &entries[a].path,
-            )
-                .cmp(&(
-                    &entries[b].docset_id,
-                    &entries[b].kind,
-                    &fold[b],
-                    &entries[b].name,
-                    &entries[b].path,
-                ))
-        });
-        let mut spans: HashMap<(String, String), (usize, usize)> = HashMap::new();
-        let mut counts: HashMap<(&str, &str), usize> = HashMap::new();
-        let mut run_start = 0_usize;
-        for (pos, &idx) in order.iter().enumerate() {
-            let key = (entries[idx].docset_id.as_ref(), entries[idx].kind.as_ref());
-            *counts.entry(key).or_default() += 1;
-            let continues = pos + 1 < order.len() && {
-                let next = order[pos + 1];
-                entries[next].docset_id == entries[idx].docset_id
-                    && entries[next].kind == entries[idx].kind
+        // Mismo orden que ordenar todo por (docset, kind, nombre plegado,
+        // nombre, ruta), pero sin comparar cadenas de docset/kind en cada
+        // comparación: se reparten las entradas en grupos (docset, kind),
+        // ya ordenados, y solo se ordena dentro de cada grupo. El reparto
+        // conserva el orden original y el sort es estable, así que los
+        // empates exactos quedan como antes. El nombre plegado es el
+        // `lower_name` que el índice ya guarda.
+        // `docset_id` y `kind` están internados: casi siempre basta con
+        // mirar la dirección del `Arc` (barato) y solo la primera vez que
+        // aparece un par se hashean las cadenas.
+        let mut group_of: HashMap<(&str, &str), u32> = HashMap::new();
+        let mut by_ptr: HashMap<(usize, usize), u32> = HashMap::new();
+        let mut groups: Vec<(&str, &str)> = Vec::new();
+        let mut gid: Vec<u32> = Vec::with_capacity(n);
+        let mut prev: Option<((usize, usize), u32)> = None;
+        for e in entries {
+            let ptrs = (e.docset_id.as_ptr() as usize, e.kind.as_ptr() as usize);
+            let id = match prev {
+                Some((p, id)) if p == ptrs => id,
+                _ => *by_ptr.entry(ptrs).or_insert_with(|| {
+                    let key = (e.docset_id.as_ref(), e.kind.as_ref());
+                    *group_of.entry(key).or_insert_with(|| {
+                        groups.push(key);
+                        (groups.len() - 1) as u32
+                    })
+                }),
             };
-            if !continues {
-                spans.insert(
-                    (
-                        entries[idx].docset_id.to_string(),
-                        entries[idx].kind.to_string(),
-                    ),
-                    (run_start, pos + 1),
-                );
-                run_start = pos + 1;
-            }
+            prev = Some((ptrs, id));
+            gid.push(id);
+        }
+        // Rango de cada grupo en el orden final (grupos en orden A-Z).
+        let mut sorted_groups: Vec<u32> = (0..groups.len() as u32).collect();
+        sorted_groups.sort_unstable_by_key(|&g| groups[g as usize]);
+        let mut sizes = vec![0_usize; groups.len()];
+        for &g in &gid {
+            sizes[g as usize] += 1;
+        }
+        let mut starts = vec![0_usize; groups.len()];
+        let mut at = 0;
+        for &g in &sorted_groups {
+            starts[g as usize] = at;
+            at += sizes[g as usize];
+        }
+        let mut order = vec![0_usize; n];
+        let mut fill = starts.clone();
+        for (idx, &g) in gid.iter().enumerate() {
+            order[fill[g as usize]] = idx;
+            fill[g as usize] += 1;
+        }
+        sort_groups(entries, &mut order, &sorted_groups, &sizes);
+        let mut spans: HashMap<(String, String), (usize, usize)> = HashMap::new();
+        for (g, &(docset, kind)) in groups.iter().enumerate() {
+            spans.insert(
+                (docset.to_string(), kind.to_string()),
+                (starts[g], starts[g] + sizes[g]),
+            );
         }
         // Agrupa conteos por docset y ordena tipos: tabla fija + resto A-Z.
         let mut per_docset: HashMap<&str, Vec<(&str, usize)>> = HashMap::new();
-        for ((docset, kind), count) in counts {
-            per_docset.entry(docset).or_default().push((kind, count));
+        for (g, &(docset, kind)) in groups.iter().enumerate() {
+            per_docset.entry(docset).or_default().push((kind, sizes[g]));
         }
         let mut kinds: HashMap<String, Vec<KindInfo>> = HashMap::new();
         for (docset, mut list) in per_docset {
@@ -241,6 +258,66 @@ impl BrowseCache {
         );
         built
     }
+}
+
+/// A partir de cuántas entradas se ordenan los grupos en varios hilos.
+const PARALLEL_SORT_MIN: usize = 50_000;
+
+/// Ordena cada grupo de `order` (contiguos, en el orden de
+/// `sorted_groups`) por (nombre plegado, nombre, ruta). Los grupos son
+/// independientes: con muchas entradas se reparten entre hilos, cada uno
+/// con trozos disjuntos de `order` (el resultado no cambia).
+fn sort_groups(
+    entries: &[IndexedEntry],
+    order: &mut [usize],
+    sorted_groups: &[u32],
+    sizes: &[usize],
+) {
+    let sort_one = |slice: &mut [usize]| {
+        slice.sort_by(|&a, &b| {
+            (&entries[a].lower_name, &entries[a].name, &entries[a].path).cmp(&(
+                &entries[b].lower_name,
+                &entries[b].name,
+                &entries[b].path,
+            ))
+        });
+    };
+    // Trozos disjuntos, uno por grupo y en orden.
+    let mut slices: Vec<&mut [usize]> = Vec::with_capacity(sorted_groups.len());
+    let mut rest = order;
+    for &g in sorted_groups {
+        let (head, tail) = rest.split_at_mut(sizes[g as usize]);
+        slices.push(head);
+        rest = tail;
+    }
+    let threads = if entries.len() >= PARALLEL_SORT_MIN {
+        std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .clamp(1, 8)
+    } else {
+        1
+    };
+    if threads == 1 || slices.len() == 1 {
+        // Un solo grupo enorme (un docset con un tipo) no se beneficia.
+        slices.into_iter().for_each(sort_one);
+        return;
+    }
+    // Reparto equilibrado: grupos de mayor a menor, cada uno al hilo con
+    // menos trabajo acumulado.
+    slices.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    let mut buckets: Vec<(usize, Vec<&mut [usize]>)> =
+        (0..threads).map(|_| (0, Vec::new())).collect();
+    for slice in slices {
+        if let Some((load, list)) = buckets.iter_mut().min_by_key(|(load, _)| *load) {
+            *load += slice.len();
+            list.push(slice);
+        }
+    }
+    std::thread::scope(|s| {
+        for (_, list) in buckets {
+            s.spawn(move || list.into_iter().for_each(sort_one));
+        }
+    });
 }
 
 impl SearchIndex {
@@ -504,5 +581,64 @@ mod tests {
         let mut sorted = rows.clone();
         sorted.sort();
         assert_eq!(rows, sorted);
+    }
+
+    /// Orden de la versión 0.1.1: un único sort global por tuplas.
+    fn reference_order(entries: &[IndexedEntry]) -> Vec<usize> {
+        let fold: Vec<String> = entries.iter().map(|e| e.name.to_lowercase()).collect();
+        let mut order: Vec<usize> = (0..entries.len()).collect();
+        order.sort_by(|&a, &b| {
+            (
+                &entries[a].docset_id,
+                &entries[a].kind,
+                &fold[a],
+                &entries[a].name,
+                &entries[a].path,
+            )
+                .cmp(&(
+                    &entries[b].docset_id,
+                    &entries[b].kind,
+                    &fold[b],
+                    &entries[b].name,
+                    &entries[b].path,
+                ))
+        });
+        order
+    }
+
+    /// El reparto por grupos da el mismo orden, rangos y conteos que el
+    /// sort global (incluidos empates exactos, mayúsculas y Unicode).
+    #[test]
+    fn grouped_rebuild_matches_global_sort() {
+        let names = [
+            "Zeta", "alpha", "Alpha", "ÁRBOL", "árbol", "beta", "beta", "_x", "10", "9",
+        ];
+        let kinds = ["Method", "Class", "clm", "Guide"];
+        let mut raw = Vec::new();
+        // Por encima de `PARALLEL_SORT_MIN`: cubre el reparto entre hilos.
+        for i in 0..(PARALLEL_SORT_MIN + 4_000) {
+            raw.push(crate::docset::Entry {
+                docset_id: format!("d{}", i % 5),
+                name: format!(
+                    "{}{}",
+                    names[i % names.len()],
+                    if i % 3 == 0 { "" } else { "s" }
+                ),
+                kind: kinds[(i / 7) % kinds.len()].to_string(),
+                // Rutas repetidas a propósito: empates exactos.
+                path: format!("p{}.html", i % 11),
+            });
+        }
+        let index = SearchIndex::build(raw);
+        let cache = BrowseCache::rebuild(&index.entries);
+        assert_eq!(cache.order, reference_order(&index.entries));
+        for ((docset, kind), &(start, end)) in &cache.spans {
+            assert!(cache.order[start..end].iter().all(|&i| {
+                index.entries[i].docset_id.as_ref() == docset
+                    && index.entries[i].kind.as_ref() == kind
+            }));
+        }
+        let total: usize = cache.kinds.values().flatten().map(|k| k.count).sum();
+        assert_eq!(total, index.entries.len());
     }
 }

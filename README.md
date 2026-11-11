@@ -22,23 +22,40 @@ Núcleo compartido y biblioteca base para el ecosistema [OpenDoc](https://github
 - **`opendoc`**: la aplicación de escritorio principal (Tauri v2 + React + TypeScript), que añade el visor con `opendoc://` en `<iframe>` aislado, barra de pestañas, command palette, gestión de catálogo con descargas HTTP, temas y acentos de color.
 - **`opendoc-cli`** (`odc`): cliente terminal que consume `opendoc-core` para buscar y abrir documentación en el navegador o visor sin levantar la interfaz de escritorio.
 
-Tanto `opendoc` como `opendoc-cli` consumen este crate a través de etiquetas Git versionadas (`tag = "v0.1.1"`) para asegurar estabilidad y paridad exacta entre ambas herramientas.
+Tanto `opendoc` como `opendoc-cli` consumen este crate a través de etiquetas Git versionadas (`tag = "v0.1.2"`) para asegurar estabilidad y paridad exacta entre ambas herramientas.
 
 ## Uso
 
 ```toml
 [dependencies]
-opendoc-core = { git = "https://github.com/daidarzzz/opendoc-core", tag = "v0.1.1" }
+opendoc-core = { git = "https://github.com/daidarzzz/opendoc-core", tag = "v0.1.2" }
 ```
 
 ```rust
 use opendoc_core::library;
 use opendoc_core::search::{search, SearchIndex};
 
-let lib = library::load(std::path::Path::new("/ruta/docsets"), None)?;
+use std::path::Path;
+
+// Segundo argumento: carpeta de caché de los tarix (solo se reutiliza,
+// nunca se extrae aquí; ver `library::LoadOptions`).
+let lib = library::load(Path::new("/ruta/docsets"), Path::new("/ruta/tarix-cache"))?;
 let mut index = SearchIndex::build_for_search(lib.entries);
+// Reutiliza el mismo índice entre teclas: si la consulta amplía la
+// anterior (`gr` → `grid`), solo se revisan sus coincidencias.
 let hits = search(&mut index, "grid", None, 20);
 ```
+
+### Rendimiento
+
+La búsqueda recorre el índice en memoria, sin SQL. Al escribir, cada tecla que amplía la consulta solo revisa las coincidencias de la anterior, y con más de 40.000 candidatos el recorrido se reparte entre hilos (hasta 8). El resultado es idéntico al de un recorrido completo en serie; los tests lo comparan consulta a consulta, también con docsets reales.
+
+Medido en release (Windows, entradas reales replicadas):
+
+| Entradas | Construir índice | Peor tecla |
+|---|---|---|
+| 300.000 | 64 ms | 17 ms |
+| 1.000.000 | 230 ms | 48 ms |
 
 ## Pruebas
 
