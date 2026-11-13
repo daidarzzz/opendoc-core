@@ -22,13 +22,13 @@ Núcleo compartido y biblioteca base para el ecosistema [OpenDoc](https://github
 - **`opendoc`**: la aplicación de escritorio principal (Tauri v2 + React + TypeScript), que añade el visor con `opendoc://` en `<iframe>` aislado, barra de pestañas, command palette, gestión de catálogo con descargas HTTP, temas y acentos de color.
 - **`opendoc-cli`** (`odc`): cliente terminal que consume `opendoc-core` para buscar y abrir documentación en el navegador o visor sin levantar la interfaz de escritorio.
 
-Tanto `opendoc` como `opendoc-cli` consumen este crate a través de etiquetas Git versionadas (`tag = "v0.1.2"`) para asegurar estabilidad y paridad exacta entre ambas herramientas.
+Tanto `opendoc` como `opendoc-cli` consumen este crate a través de etiquetas Git versionadas (`tag = "v0.2.0"`) para asegurar estabilidad y paridad exacta entre ambas herramientas.
 
 ## Uso
 
 ```toml
 [dependencies]
-opendoc-core = { git = "https://github.com/daidarzzz/opendoc-core", tag = "v0.1.2" }
+opendoc-core = { git = "https://github.com/daidarzzz/opendoc-core", tag = "v0.2.0" }
 ```
 
 ```rust
@@ -44,6 +44,19 @@ let mut index = SearchIndex::build_for_search(lib.entries);
 // Reutiliza el mismo índice entre teclas: si la consulta amplía la
 // anterior (`gr` → `grid`), solo se revisan sus coincidencias.
 let hits = search(&mut index, "grid", None, 20);
+```
+
+### Importar DevDocs
+`devdocs::convert` transforma un paquete de DevDocs (`index.json` + `db.json`) en un
+`.docset` estándar, de modo que búsqueda, navegación y CLI lo tratan como cualquier otro.
+Sanea las rutas, reescribe los enlaces internos, repara anclas y es atómico (ante un
+fallo conserva el docset anterior). La descarga HTTP la hace quien lo consume.
+
+```rust
+use opendoc_core::devdocs::{convert, parse_catalog};
+// `docs.json` → metadatos; `index.json` y `db.json` descargados por el llamador.
+let meta = &parse_catalog(&docs_json)?[0];
+let report = convert(&index_json, &db_json, meta, Path::new("/ruta/docsets/CSS.docset"))?;
 ```
 
 ### Rendimiento
