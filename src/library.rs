@@ -1,15 +1,9 @@
-//! Carga compartida de una carpeta de docsets.
+//! Loads a directory of docsets for desktop and command-line consumers.
 //!
-//! La app y el CLI necesitan exactamente el mismo recorrido:
-//!
-//! 1. Escanear la carpeta (`docset::scan_dir`).
-//! 2. Reutilizar las cachés tarix ya extraídas (por defecto **no** se
-//!    extrae nada; el CLI nunca bloquea al usuario).
-//! 3. Leer los índices de los docsets clásicos (aprovechando las entradas
-//!    que el escáner ya abrió para resolver la página de inicio).
-//! 4. Devolver docsets, pendientes, issues y todas las entradas.
-//!
-//! Nada de Tauri ni de red aquí: solo disco y SQLite.
+//! The loader scans the source directory, reads SQLite symbol indexes and
+//! reuses existing tarix cache entries. [`load`] leaves uncached archives
+//! pending. Use [`load_with_options`] to configure extraction or call
+//! [`install_pending`] to extract an individual pending archive.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

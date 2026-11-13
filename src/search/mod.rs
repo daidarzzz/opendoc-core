@@ -1,6 +1,7 @@
-//! Búsqueda en memoria (`search/`).
+//! In-memory symbol search using exact, prefix and fuzzy matching.
 //!
-//! La búsqueda interactiva se hace aquí, no con `LIKE` en SQL (SPEC §4.2).
+//! Reuse a [`SearchIndex`] across queries to benefit from scratch-buffer
+//! reuse and incremental candidate filtering when a query is extended.
 
 pub mod filter;
 pub mod index;

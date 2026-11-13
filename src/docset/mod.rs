@@ -1,9 +1,8 @@
-//! Escaneo de carpetas `.docset`, lectura de `Info.plist`, índices SQLite
-//! e instalación/extracción tarix.
+//! Discovers Dash and Zeal docsets, reads their metadata and symbol indexes,
+//! and extracts supported archives.
 //!
-//! Toda la lógica es independiente de Tauri y está cubierta por tests.
-//! Los docsets son entrada no confiable: lo corrupto se registra en
-//! `ScanReport::issues` sin abortar el escaneo.
+//! [`scan_dir`] reports problems with individual docsets through
+//! [`ScanReport::issues`] so callers can still use the rest of the collection.
 
 pub mod icon;
 pub mod index;

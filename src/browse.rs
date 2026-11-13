@@ -1,9 +1,7 @@
-//! Navegación por tipos (v0.2): tipos con contadores y entradas paginadas.
+//! Groups indexed symbols by kind and returns paginated entries.
 //!
-//! Trabaja sobre `&SearchIndex`, sin lecturas nuevas de SQLite: ordenar y
-//! contar se paga una sola vez al (re)construir el índice (`BrowseCache` se
-//! invalida solo; `extend` lo reconstruye, p. ej. al instalar un tarix).
-//! El orden de entradas es determinista: (nombre plegado, nombre, ruta).
+//! Browsing reuses the in-memory search index. Entry ordering is deterministic
+//! by folded name, display name and path.
 
 use std::collections::HashMap;
 

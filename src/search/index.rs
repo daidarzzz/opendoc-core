@@ -1,17 +1,9 @@
-//! Índice en memoria para la búsqueda interactiva (T5).
+//! In-memory index for interactive symbol search.
 //!
-//! - `build` consume las `Entry` de los docsets abribles y las deja en un
-//!   `Vec` contiguo. El llamador decide qué entra: los docsets tarix con
-//!   `MissingDocuments` (p. ej. el C++ de Zeal) no se indexan hasta v1.0.
-//! - `docset_id` y `kind` se repiten miles de veces: se internan en
-//!   `Arc<str>` vía pool para no duplicar `String` por entrada.
-//! - `Matcher` de nucleo (~135 KB de scratch) y el buffer UTF-32 se
-//!   reutilizan entre búsquedas (uno por hilo de búsqueda); `search` (en
-//!   `query.rs`) toma `&mut SearchIndex` por eso, pero es determinista y
-//!   no toca Tauri (T6 lo llamará tras `Mutex`/`spawn_blocking`).
-//! - `search` recuerda los candidatos de la última consulta: al escribir
-//!   (`bo` → `bor`) solo vuelve a mirar esos. Cualquier cambio en las
-//!   entradas (`extend`, `remove_docset`, `replace_docset`) la olvida.
+//! Index entries share repeated docset identifiers and kind names. The index
+//! keeps matcher scratch buffers and remembers candidates from the previous
+//! query. Mutations invalidate those candidates so later searches see the
+//! current entries.
 
 use std::collections::HashMap;
 use std::sync::Arc;

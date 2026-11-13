@@ -1,27 +1,9 @@
-//! Importador de paquetes DevDocs → docset de OpenDoc.
+//! Converts DevDocs packages to standard Dash and Zeal docsets.
 //!
-//! DevDocs publica por documentación un `index.json` (entradas) y un
-//! `db.json` (mapa `ruta → fragmento HTML`). [`convert`] los transforma una
-//! sola vez, al instalar, en un `<Nombre>.docset` estándar
-//! (`Info.plist` + `docSet.dsidx` + `Documents/*.html`), de modo que la
-//! búsqueda, el navegador por tipos, el servidor de ficheros y la CLI lo
-//! tratan igual que cualquier docset de Dash/Zeal.
-//!
-//! Garantías:
-//! - Entrada no confiable: las claves se sanean (ver [`paths`]) y nada se
-//!   escribe fuera del directorio temporal de la conversión.
-//! - Atómico: se construye en un directorio temporal hermano y solo se
-//!   renombra al destino si todo salió bien; ante cualquier error el
-//!   destino previo queda intacto.
-//! - Tolerante con los enlaces: los enlaces internos se reescriben a los
-//!   ficheros reales, los muertos se desactivan (`#`) y las anclas que
-//!   DevDocs pierde en la cabecera de la página se recrean.
-//! - Estricto con el paquete: sin páginas, sin entradas válidas o con
-//!   demasiadas entradas sin página, la conversión se cancela.
-//!
-//! La descarga HTTP no vive aquí (el core no tiene cliente HTTP): la
-//! aplicación obtiene los bytes ([`index_url`], [`db_url`]) y llama a
-//! [`convert`].
+//! The caller obtains the catalog and package bytes. [`convert`] reads the
+//! package index and HTML fragments, validates paths, rewrites internal links
+//! and generates an SQLite symbol index. Conversion stages output in a sibling
+//! directory before committing it to the requested destination.
 
 mod links;
 mod paths;

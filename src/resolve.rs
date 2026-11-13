@@ -1,14 +1,8 @@
-//! Resolución segura de rutas dentro de `Documents/` (T8).
+//! Resolves document requests within a docset's `Documents/` directory.
 //!
-//! - Decodifica `%XX` en bucle (caza `%2e`, `%2E%2F`, `%252e`) ANTES de
-//!   validar, con tope de rondas.
-//! - Rechaza: NUL, letra de unidad (`C:`), barras invertidas (se
-//!   normalizan a `/` primero), segmentos `..` y rutas absolutas.
-//! - Exige fichero existente, rechaza symlinks y verifica con
-//!   `canonicalize` + prefijo (cubre symlinks intermedios y `..`
-//!   residuales, incluido Windows insensible a mayúsculas).
-//! - El `#ancla` y el `?query` se cortan antes de resolver (el `#` ni
-//!   siquiera llega al servidor; el scroll intra-página es del cliente).
+//! [`resolve_request`] removes query and fragment suffixes and decodes URL
+//! escapes before validating the path. It checks that the target is a file and
+//! that its canonical path stays within the canonical documents directory.
 
 use std::path::{Path, PathBuf};
 
