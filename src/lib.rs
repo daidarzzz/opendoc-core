@@ -6,6 +6,7 @@
 //! consumen por igual.
 
 pub mod browse;
+pub mod devdocs;
 pub mod docset;
 pub mod library;
 pub mod persist;

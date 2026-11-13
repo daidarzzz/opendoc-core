@@ -1,0 +1,33 @@
+/* Hoja de estilos propia de OpenDoc para páginas convertidas de DevDocs. */
+:root{color-scheme:light}
+body{margin:0;background:#fff;color:#1f2328;font:15px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}
+._page{max-width:56rem;margin:0 auto;padding:1.25rem 1.5rem 3rem}
+h1,h2,h3,h4{line-height:1.25;margin:1.6em 0 .5em;font-weight:600}
+h1{font-size:1.9rem;margin-top:.2em;border-bottom:1px solid #d8dee4;padding-bottom:.3em}
+h2{font-size:1.4rem;border-bottom:1px solid #eaeef2;padding-bottom:.2em}h3{font-size:1.15rem}h4{font-size:1rem}
+a{color:#0969da;text-decoration:none}a:hover{text-decoration:underline}
+code,pre,kbd,samp{font:13.5px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+code{background:#eff1f3;padding:.12em .35em;border-radius:4px}
+pre{background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;padding:.8rem 1rem;overflow:auto;margin:1em 0}
+pre code{background:none;padding:0}
+.token.comment,.token.prolog{color:#6a737d}.token.keyword,.token.atrule,.token.selector{color:#cf222e}
+.token.string,.token.url{color:#0a3069}.token.number,.token.boolean,.token.property{color:#0550ae}
+.token.function,.token.class-name{color:#8250df}.token.punctuation{color:#57606a}
+table{border-collapse:collapse;margin:1em 0;display:block;overflow-x:auto;max-width:100%}
+th,td{border:1px solid #d0d7de;padding:.35rem .6rem;text-align:left;vertical-align:top}th{background:#f6f8fa}
+img{max-width:100%;height:auto}blockquote{margin:1em 0;padding:0 1em;border-left:4px solid #d0d7de;color:#57606a}
+dt{margin-top:1em}dd{margin-left:1.5rem}ul,ol{padding-left:1.6rem}
+details{margin:1em 0;border:1px solid #d0d7de;border-radius:6px;padding:.4rem .8rem}summary{cursor:pointer;font-weight:600}
+.baseline-indicator.high{border-color:#2da44e;background:#f0fff4}.baseline-indicator.not{border-color:#bf8700;background:#fff8c5}
+.not-bold{font-weight:400}.status-title{display:inline}
+.notecard,.admonition,.warning,.note,.deprecated,.versionadded,.versionchanged,.versionremoved{margin:1em 0;padding:.6rem 1rem;border-left:4px solid #0969da;background:#f6f8fa;border-radius:0 6px 6px 0}
+.notecard.warning,.warning,.deprecated{border-color:#bf8700;background:#fff8c5}
+.versionmodified{font-style:italic;color:#57606a}
+.bc-table th,.bc-table td{font-size:12px;padding:.25rem .4rem;text-align:center;white-space:nowrap}
+.bc-table td.bc-supports-yes{background:#aceebb}.bc-table td.bc-supports-no{background:#ffc1ba}.bc-table td.bc-supports-partial{background:#f5e08a}
+.bc-supports-preview,.bc-supports-unknown{background:#eff1f3}.bc-table abbr{text-decoration:none;border:0}
+dl.py>dt.sig,dl.c>dt.sig,.sig{background:#f1f5fb;border-left:3px solid #0969da;padding:.3rem .7rem;border-radius:0 4px 4px 0;font-family:ui-monospace,Menlo,Consolas,monospace}
+.sig code{background:none}.headerlink{display:none}
+section{margin:0}.toctree-wrapper ul{list-style:none;padding-left:1rem}
+._attribution{margin-top:3rem;padding-top:.8rem;border-top:1px solid #d8dee4;font-size:12px;color:#57606a}
+._attribution-link{word-break:break-all}
